@@ -561,6 +561,50 @@ def show_oews_soc2():
         st.error(f"Error loading OEWS SOC2: {e}")
 
 
+_STATE_SOURCE_ORDER = ["JOLTS", "v1", "v2", "Lightcast"]
+_STATE_COLORS = [_RED, _ORANGE, _BLUE, _GOLD]
+
+
+def show_jolts_state():
+    """JOLTS vs v1 vs v2 vs Lightcast state distribution charts (2024)."""
+    st.subheader("Benchmark: State Share of Postings vs JOLTS Job Openings (2024)")
+    try:
+        js = _query(f"{TABLE_PREFIX}_JOLTS_STATE_COMPARISON")
+        if js.empty:
+            st.info("No JOLTS state data returned.")
+            return
+
+        # ── Grouped bar chart: top 15 states by JOLTS share (descending) ──
+        top15 = js.nlargest(15, "jolts_pct").sort_values("jolts_pct", ascending=False)
+        top15["state"] = top15["state"].str.title()
+        bar_long = top15[["state", "jolts_pct", "v1_pct", "v2_pct", "lc_pct"]].melt(
+            id_vars="state", var_name="source", value_name="pct")
+        bar_long["source"] = bar_long["source"].replace({
+            "jolts_pct": "JOLTS", "v1_pct": "v1", "v2_pct": "v2", "lc_pct": "Lightcast"})
+        order = top15["state"].tolist()
+        state_color = alt.Color(
+            "source:N", title="Source", sort=_STATE_SOURCE_ORDER,
+            scale=alt.Scale(domain=_STATE_SOURCE_ORDER, range=_STATE_COLORS),
+            legend=_LEGEND,
+        )
+        bar_chart = (
+            alt.Chart(bar_long, title="Top 15 States: Share of Postings vs JOLTS Job Openings")
+            .mark_bar()
+            .encode(
+                y=alt.Y("state:N", sort=order, **_Y_AXIS),
+                yOffset=alt.YOffset("source:N", sort=_STATE_SOURCE_ORDER),
+                x=alt.X("pct:Q", axis=_x_axis(title="Share (%)"), stack=None),
+                color=state_color,
+                tooltip=["state", "source", alt.Tooltip("pct:Q", format=".1f")],
+            )
+            .properties(height=600)
+        )
+        st.altair_chart(bar_chart, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Error loading JOLTS state comparison: {e}")
+
+
 # ─────────────────────────── MAIN APP ──────────────────────────────────
 def main():
     st.title("Postings Release Comparison: v1 vs v2 vs Lightcast")
@@ -611,6 +655,10 @@ def main():
     # ── JOLTS industry benchmark (industry topic only) ──
     if topic == "industry_naics2":
         show_jolts_industry()
+
+    # ── JOLTS state benchmark (location topic only) ──
+    if topic == "location":
+        show_jolts_state()
 
     # ── OEWS SOC-2 benchmark (occupation topic only) ──
     if topic == "occupation":

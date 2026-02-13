@@ -12,12 +12,14 @@ import snowflake.connector as snow
 from datetime import datetime
 import os
 import importlib.util
+import requests
+import json
 
 # ─────────────────────────── SOURCE TABLES ───────────────────────────
 V1_TABLE = "revelio_clean.v1.bgi_postings"
 V2_TABLE = "revelio_clean.bgi_2026_02.bgi_postings"
 LC_TABLE = "bgi_postings_backups.dec_25.us_postings"
-SALARY_TABLE = "temporary_data.dsexton.salary_infer_full_eval"
+SALARY_TABLE = "temporary_data.dsexton.postings_salary_feb2026"
 ONET_SOC_LOOKUP = "temporary_data.jnania.onet_soc_lookup"
 
 # Date / ID columns
@@ -30,6 +32,26 @@ LC_ID = "id"
 
 FULL_MIN_YEAR = 2015
 TABLE_PREFIX = "BGI_REL"
+
+# ─────────────────────────── BLS JOLTS STATE DATA ────────────────────────
+BLS_API_KEY = "3de7ff442de94a6e9b5fd3249b98b077"
+BLS_URL = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
+
+STATE_FIPS = {
+    "01": "ALABAMA", "02": "ALASKA", "04": "ARIZONA", "05": "ARKANSAS",
+    "06": "CALIFORNIA", "08": "COLORADO", "09": "CONNECTICUT", "10": "DELAWARE",
+    "11": "DISTRICT OF COLUMBIA", "12": "FLORIDA", "13": "GEORGIA", "15": "HAWAII",
+    "16": "IDAHO", "17": "ILLINOIS", "18": "INDIANA", "19": "IOWA",
+    "20": "KANSAS", "21": "KENTUCKY", "22": "LOUISIANA", "23": "MAINE",
+    "24": "MARYLAND", "25": "MASSACHUSETTS", "26": "MICHIGAN", "27": "MINNESOTA",
+    "28": "MISSISSIPPI", "29": "MISSOURI", "30": "MONTANA", "31": "NEBRASKA",
+    "32": "NEVADA", "33": "NEW HAMPSHIRE", "34": "NEW JERSEY", "35": "NEW MEXICO",
+    "36": "NEW YORK", "37": "NORTH CAROLINA", "38": "NORTH DAKOTA", "39": "OHIO",
+    "40": "OKLAHOMA", "41": "OREGON", "42": "PENNSYLVANIA", "44": "RHODE ISLAND",
+    "45": "SOUTH CAROLINA", "46": "SOUTH DAKOTA", "47": "TENNESSEE", "48": "TEXAS",
+    "49": "UTAH", "50": "VERMONT", "51": "VIRGINIA", "53": "WASHINGTON",
+    "54": "WEST VIRGINIA", "55": "WISCONSIN", "56": "WYOMING",
+}
 
 # ─────────────────────────── SNOWFLAKE CONNECTION ─────────────────────────
 config_file_path = r"C:\Users\JuliaNania\OneDrive - Burning Glass Institute\Documents\Python\config.py"
@@ -640,6 +662,102 @@ def sql_salary_coverage():
     """
 
 
+# ─────────────────────── JOLTS STATE COMPARISON ──────────────────────────
+
+def fetch_and_upload_jolts_state(conn):
+    """Fetch JOLTS state-level job openings (2024) via BLS API and upload to staging table."""
+    # Build series IDs: JTS + 000000 (total nonfarm) + {state_fips} + 0000000 + JO + L
+    series_ids = {f"JTS000000{code}0000000JOL": name for code, name in STATE_FIPS.items()}
+    all_ids = list(series_ids.keys())
+
+    # Fetch in 2 batches (API allows up to 50 per request)
+    jolts_rows = []
+    for batch in [all_ids[:26], all_ids[26:]]:
+        payload = json.dumps({
+            "seriesid": batch, "startyear": "2024", "endyear": "2024",
+            "annualaverage": True, "registrationkey": BLS_API_KEY,
+        })
+        resp = requests.post(BLS_URL, data=payload, headers={"Content-type": "application/json"})
+        resp.raise_for_status()
+        data = resp.json()
+        for series in data["Results"]["series"]:
+            sid = series["seriesID"]
+            state_name = series_ids[sid]
+            monthly_vals = [
+                float(item["value"]) * 1000
+                for item in series["data"]
+                if item["year"] == "2024" and item["period"] != "M13"
+            ]
+            if monthly_vals:
+                jolts_rows.append((state_name, round(sum(monthly_vals) / len(monthly_vals))))
+
+    # Upload to staging table
+    raw_table = f"{TABLE_PREFIX}_JOLTS_STATE_RAW"
+    execute_ddl(f"CREATE OR REPLACE TABLE {raw_table} (STATE VARCHAR, JOLTS_COUNT NUMBER)", conn)
+    cur = conn.cursor()
+    try:
+        cur.executemany(
+            f"INSERT INTO {raw_table} (STATE, JOLTS_COUNT) VALUES (%s, %s)",
+            jolts_rows,
+        )
+        conn.commit()
+    finally:
+        cur.close()
+    print(f"  Uploaded {len(jolts_rows)} states to {raw_table}")
+
+
+def sql_jolts_state_comparison():
+    """Join JOLTS state raw data with v1/v2/lc state counts; compute pct shares."""
+    raw_table = f"{TABLE_PREFIX}_JOLTS_STATE_RAW"
+    return f"""
+WITH
+jolts AS (SELECT STATE, JOLTS_COUNT FROM {raw_table}),
+jolts_total AS (SELECT SUM(JOLTS_COUNT) AS total FROM jolts),
+v1_state AS (
+    SELECT UPPER(TRIM(v1.BGI_STATE)) AS STATE, COUNT(DISTINCT v1.{V1_ID}) AS V1_COUNT
+    FROM {V1_TABLE} v1
+    WHERE v1.BGI_STATE IS NOT NULL AND v1.bgi_country = 'United States'
+      AND YEAR(v1.{V1_DATE}) = 2024
+    GROUP BY 1
+),
+v1_total AS (SELECT SUM(V1_COUNT) AS total FROM v1_state),
+v2_state AS (
+    SELECT UPPER(TRIM(v2.BGI_STATE)) AS STATE, COUNT(DISTINCT v2.{V2_ID}) AS V2_COUNT
+    FROM {V2_TABLE} v2
+    WHERE v2.BGI_STATE IS NOT NULL AND v2.bgi_country = 'United States'
+      AND YEAR(v2.{V2_DATE}) = 2024
+    GROUP BY 1
+),
+v2_total AS (SELECT SUM(V2_COUNT) AS total FROM v2_state),
+lc_state AS (
+    SELECT UPPER(TRIM(lc.STATE_NAME)) AS STATE, COUNT(DISTINCT lc.{LC_ID}) AS LC_COUNT
+    FROM {LC_TABLE} lc
+    WHERE lc.STATE_NAME IS NOT NULL AND YEAR(lc.{LC_DATE}) = 2024
+    GROUP BY 1
+),
+lc_total AS (SELECT SUM(LC_COUNT) AS total FROM lc_state)
+SELECT
+    j.STATE,
+    j.JOLTS_COUNT,
+    CASE WHEN jt.total > 0 THEN ROUND(j.JOLTS_COUNT / jt.total * 100, 1) ELSE 0 END AS JOLTS_PCT,
+    COALESCE(v1.V1_COUNT, 0) AS V1_COUNT,
+    CASE WHEN v1t.total > 0 THEN ROUND(COALESCE(v1.V1_COUNT, 0) / v1t.total * 100, 1) ELSE 0 END AS V1_PCT,
+    COALESCE(v2.V2_COUNT, 0) AS V2_COUNT,
+    CASE WHEN v2t.total > 0 THEN ROUND(COALESCE(v2.V2_COUNT, 0) / v2t.total * 100, 1) ELSE 0 END AS V2_PCT,
+    COALESCE(lc.LC_COUNT, 0) AS LC_COUNT,
+    CASE WHEN lct.total > 0 THEN ROUND(COALESCE(lc.LC_COUNT, 0) / lct.total * 100, 1) ELSE 0 END AS LC_PCT
+FROM jolts j
+LEFT JOIN v1_state v1 ON j.STATE = v1.STATE
+LEFT JOIN v2_state v2 ON j.STATE = v2.STATE
+LEFT JOIN lc_state lc ON j.STATE = lc.STATE
+CROSS JOIN jolts_total jt
+CROSS JOIN v1_total v1t
+CROSS JOIN v2_total v2t
+CROSS JOIN lc_total lct
+ORDER BY JOLTS_PCT DESC
+"""
+
+
 # ─────────────────────────── MAIN ─────────────────────────────
 def main():
     print(f"[{datetime.now()}] Starting BGI v1 vs v2 vs Lightcast temp table creation...")
@@ -753,6 +871,23 @@ def main():
             total += 1
         except Exception as e:
             print(f"  ✗ {name}: {e}")
+
+    # ── 5. JOLTS state comparison ──────────────────────────────────────
+    print(f"\n[{datetime.now()}] Fetching JOLTS state-level data from BLS API...")
+    try:
+        fetch_and_upload_jolts_state(conn)
+        total += 1
+    except Exception as e:
+        print(f"  ✗ Failed to upload JOLTS state data: {e}")
+
+    jolts_state_table = f"{TABLE_PREFIX}_JOLTS_STATE_COMPARISON"
+    print(f"\n[{datetime.now()}] Creating {jolts_state_table}...")
+    try:
+        execute_ddl(f"CREATE OR REPLACE TABLE {jolts_state_table} AS\n{sql_jolts_state_comparison()}", conn)
+        print(f"  ✓ {jolts_state_table}")
+        total += 1
+    except Exception as e:
+        print(f"  ✗ {jolts_state_table}: {e}")
 
     conn.close()
     print(f"\n[{datetime.now()}] ═══════════════════════════════════════")
